@@ -1,7 +1,7 @@
 from concurrent.futures import ProcessPoolExecutor
 from enum import Enum
 import argparse
-from math import ceil
+from math import ceil, pi
 import random
 import time
 import numpy as np
@@ -11,8 +11,8 @@ from scipy.stats import unitary_group
 
 ################################ Constants ################################
 
-NUM_QUBITS = 100
-PARALLELIZATION_THRESHOLD = 500000
+NUM_QUBITS = 20
+PARALLELIZATION_THRESHOLD = 20
 NOISE_PROB = 0.125  # 1/8
 
 # 1-qubit Gates
@@ -24,6 +24,7 @@ H_GATE = np.array([[1, 1], [1, -1]]) / np.sqrt(2)
 # Base states
 COMP_BASE_STATES = [np.array([1, 0]), np.array([0, 1])]  # Z base
 X_BASE_STATES = [np.array([1, 1]) / np.sqrt(2), np.array([1, -1]) / np.sqrt(2)]  # X base
+BREIDBART_BASE = [np.array([np.cos(pi / 8), np.sin(pi / 8)]), np.array([-np.sin(pi / 8), np.cos(pi / 8)])]
 
 
 # Enums
@@ -54,11 +55,6 @@ class ChannelMode(Enum):
 
     def __str__(self):
         return self.value
-
-
-def main():
-    args = cli()
-    qkd_bb83_algorithm(print_mode=False)
 
 
 def cli() -> argparse.Namespace:
@@ -134,30 +130,6 @@ def print_output(required_mode: Output, current_mode: Output, msg: str):
         print(msg)
 
 
-def qkd_bb83_algorithm(
-    qber_sacrifice_fraction: float = 0.5,
-    print_mode: Output = Output.NONE,
-    ch_mode: ChannelMode = ChannelMode.NOISY,
-):
-    print_output(Output.EXTEND, print_mode, "start quantum phase")
-    alice, bob, estimated_qber, true_qber = bb84_quantum_phase(qber_sacrifice_fraction, print_mode)
-
-    if ch_mode is ChannelMode.NOISY:
-        print_output(Output.EXTEND, print_mode, "start reconciliation phase (cascade algorithm)")
-        reconciliation = Cascade(alice.key_after_qber, bob.key_after_qber, estimated_qber)
-        reconciliation.cascade()
-    elif ch_mode is ChannelMode.EAVESDROPPING:
-        pass
-
-    print(f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}. Final key length: {reconciliation._key_len}")
-    print("**************** quantum bit error rate ****************")
-    print(f"estimated error: {estimated_qber}")
-    print(f"true error: {true_qber}")
-    print(f"reveled bits rate {len(reconciliation._reveled_bits)/ reconciliation._key_len}")
-    print(np.sum(np.array(bob.key_after_qber) ^ np.array(alice.key_after_qber)))
-    print(np.sum(np.array(reconciliation._noisy_key) ^ np.array(alice.key_after_qber)))
-
-
 def compact_complex_repr(num: complex) -> str:
     if np.isreal(num):
         if num.real == 1:
@@ -227,12 +199,13 @@ class Qubit:
             int: The measurement result bit (the first base state always represented by the 'zero' result)
         """
         if base is not None:
-            self._state = base.conj().T @ self._state
+            base_gate = np.column_stack(base)  # The unitary gate induced by the base
+            self._state = base_gate.conj().T @ self._state
         prob = np.square(np.abs(self._state))  # Calc the weighted probabilities
         res = random.choices([0, 1], weights=prob)[0]  # The weighted probability measurement
         self._state = COMP_BASE_STATES[res]  # The collapsed state
         if base is not None:
-            self._state = base @ self._state
+            self._state = base_gate @ self._state
         return res
 
 
@@ -241,7 +214,7 @@ class Player:
 
     def __init__(self, rnd=None):
         # random generator, if not provided use default_rng()
-        self._rnd = rnd if not None else np.random.default_rng()
+        self._rnd = rnd if rnd is not None else np.random.default_rng()
 
         self._key = None  # ndarray: The full original key (before agreement phase)
         self._agreed_key = None  # ndarray: The agreed key (after agreement phase)
@@ -268,7 +241,7 @@ class Player:
     @property
     def key_after_qber(self) -> np.ndarray:
         """ndarray: The agreed key after discarding random bits (qber calculation phase)"""
-        return self._agreed_key
+        return self._key_after_qber
 
     @key_after_qber.setter
     def key_after_qber(self, value: np.ndarray):
@@ -286,7 +259,11 @@ class Player:
 
 
 class Alice(Player):
-    """Alice class represent alice's part of the BB84 algorithm"""
+    """Alice class represent Alice's part of the BB84 algorithm
+
+    Args:
+        rnd (any, optional): Random generator object.
+    """
 
     def __init__(self, rnd=None):
         Player.__init__(self, rnd)
@@ -320,14 +297,16 @@ class Alice(Player):
         """
         self._encoding_base = self._rnd.integers(2, size=NUM_QUBITS)  # Choose encoding base randomly
 
-        def task(index: int):  # Encoding one key bit into 1-qubit state
+        def task(index: int) -> Qubit:  # Encoding one key bit into 1-qubit state
             base = self._encoding_base[index]
             key_bit = self._key[index]
             qubit = self._quantum_state[index]
             if key_bit == 1:
                 qubit.apply_gate(X_GATE)
-            if base is Base.X:
+            if base == Base.X.value:
                 qubit.apply_gate(H_GATE)
+            print(qubit)
+            return qubit
 
         if NUM_QUBITS < PARALLELIZATION_THRESHOLD:
             # Small key, multiprocessing overhead is too expensive
@@ -344,7 +323,6 @@ class Alice(Player):
         """Send state to Bob over the quantum channel.
 
         Noisy channel -> There is NOISE_PROB chance for every qubit to get noisy (arbitrary unitary rotation)
-        Eavesdropping channel -> Eve act as MITM (measures the sent qubits).
 
         If key length is over the PARALLELIZATION THRESHOLD, break the process to multiprocessors task.
 
@@ -356,8 +334,6 @@ class Alice(Player):
         """
         if mode is ChannelMode.NOISY:  # Noise on the quantum channel
             self._noisy_channel()
-        elif mode is ChannelMode.EAVESDROPPING:
-            self._eve_channel()
 
         return self._quantum_state
 
@@ -381,32 +357,79 @@ class Alice(Player):
             with ProcessPoolExecutor() as pool:
                 pool.map(task, noise_indexes, chunksize=NUM_QUBITS)
 
-    def _eve_channel(self):
-        pass
-
 
 class Bob(Player):
+    """Bob class represent Bob's part of the BB84 algorithm
+
+    Args:
+        state (list[Qubit]): The quantum state sent to bob.
+        rnd (any, optional): Random generator object.
+    """
+
     def __init__(self, state: list[Qubit], rnd=None):
         Player.__init__(self, rnd)
         self._quantum_state = state
 
     def measure_all_qubits(self) -> np.ndarray:
-        self._encoding_base = self._rnd.integers(2, size=NUM_QUBITS)
-        self._key = np.zeros_like(self._encoding_base)
+        """Measure the received quantum state according to guessed encoding bases (randomized).
 
-        st = time.time()
-        for i in range(NUM_QUBITS):
-            base = self._encoding_base[i]
-            qubit = self._quantum_state[i]
+        Returns:
+            np.ndarray: The measured key (bits)
+        """
+        self._encoding_base = self._rnd.integers(2, size=NUM_QUBITS)  # Guess Alice's encoding base randomly
+        self._key = np.zeros_like(self._encoding_base)  # Create an "empty" key with the correct length
+
+        def task(index: int):  # Measure 1-qubit state in the guessed base
+            base = self._encoding_base[index]
+            qubit = self._quantum_state[index]
             if base is Base.X:
-                res = qubit.measure(H_GATE)
+                res = qubit.measure(X_BASE_STATES)
             else:
                 res = qubit.measure()
-            self._key[i] = res
-        et = time.time()
-        print(f"Bob measure time: {et - st}")
+            self._key[index] = res  # Save the measurement result in Bob's key
+
+        if NUM_QUBITS < PARALLELIZATION_THRESHOLD:
+            # Small key, multiprocessing overhead is too expensive
+            # Iterate sequently over all bits
+            for i in range(NUM_QUBITS):
+                task(i)
+        else:  # multiprocessing the task to simulate quantum parallelism
+            with ProcessPoolExecutor() as pool:
+                pool.map(task, range(NUM_QUBITS), chunksize=NUM_QUBITS)
 
         return self._key
+
+
+class Eve(Player):
+    """Eve class represent an eavesdropper on the quantum channel of the BB84 algorithm.
+
+    Args:
+        state (list[Qubit]): The quantum state sent to bob.
+    """
+
+    def measure_eavesdropped_qubits(self, state: list[Qubit]) -> tuple[list[Qubit], np.ndarray]:
+        """Measure the eavesdropped quantum state according to the BREIDBART base.
+
+        Returns:
+            np.ndarray: The measured key (bits)
+        """
+        self._quantum_state = state
+        self._key = np.zeros(NUM_QUBITS)  # Create an "empty" key with the correct length
+
+        def task(index: int):  # Measure 1-qubit state in the BREIDBART base
+            qubit = self._quantum_state[index]
+            self._key[index] = qubit.measure(BREIDBART_BASE)  # Save the measurement result in Eve's key
+
+        if NUM_QUBITS < PARALLELIZATION_THRESHOLD:
+            # Small key, multiprocessing overhead is too expensive
+            # Iterate sequently over all bits
+            for i in range(NUM_QUBITS):
+                task(i)
+        else:  # multiprocessing the task to simulate quantum parallelism
+            with ProcessPoolExecutor() as pool:
+                pool.map(task, range(NUM_QUBITS), chunksize=NUM_QUBITS)
+
+        return self._quantum_state, self._key
 
 
 def print_quantum_phase_summary(alice: Alice, bob: Bob, estimated_qber: float, true_qber: float):
@@ -428,53 +451,36 @@ def print_quantum_phase_summary(alice: Alice, bob: Bob, estimated_qber: float, t
     print(f"Bob's agreed key: {bob.key_after_qber}")
 
 
-def agreed_key(alice: Alice, bob: Bob):
-    alice_key = alice.key
-    alice_bases = alice.encoding_bases
-    bob_key = bob.key
-    bob_bases = bob.encoding_bases
-    alice_agreed_key = []
-    bob_agreed_key = []
-    for i in range(NUM_QUBITS):
-        if alice_bases[i] == bob_bases[i]:
-            alice_agreed_key.append(alice_key[i])
-            bob_agreed_key.append(bob_key[i])
-    alice.agreed_key = alice_agreed_key
-    bob.agreed_key = bob_agreed_key
-    return alice_agreed_key, bob_agreed_key
+def agreed_key(alice: Alice, bob: Bob, eve: Eve = None) -> np.ndarray:
+    same_base_indexes = np.where(alice.encoding_bases == bob.encoding_bases)[0]
+
+    alice.agreed_key = alice.key[same_base_indexes].copy()
+    bob.agreed_key = bob.key[same_base_indexes].copy()
+    if eve is not None:
+        eve.agreed_key = eve.key[same_base_indexes].copy()
+    return same_base_indexes
 
 
-def calculate_qber(alice: Alice, bob: Bob, sacrifice_fraction: float) -> tuple[float, float]:
+def calculate_qber(
+    alice: Alice, bob: Bob, eve: Eve = None, sacrifice_fraction: float = 0.5
+) -> tuple[float, float]:
     key_length = len(alice.agreed_key)
     index_perm = np.random.permutation(key_length)
-    random_sacrifice_bits, bits_left = (
+    random_sacrifice_bits, remain_bits = (
         index_perm[: ceil(sacrifice_fraction * key_length)],
         index_perm[ceil(sacrifice_fraction * key_length) :],
     )
-    # random_sacrifice_bits = random.sample(range(key_length), k=floor(sacrifice_fraction * key_length))
 
-    alice_key, bob_key = np.array(alice.agreed_key), np.array(bob.agreed_key)
+    alice_key, bob_key = alice.agreed_key, bob.agreed_key
     estimated_qber = np.average(alice_key[random_sacrifice_bits] ^ bob_key[random_sacrifice_bits])
     true_qber = np.average(alice_key ^ bob_key)
-    alice.key_after_qber, bob.key_after_qber = alice_key[bits_left], bob_key[bits_left]
+    alice.key_after_qber, bob.key_after_qber = alice_key[remain_bits], bob_key[remain_bits]
+    if eve is not None:
+        eve.key_after_qber = eve.agreed_key[remain_bits].copy()
     return estimated_qber, true_qber
 
 
-def bb84_quantum_phase(sacrifice_fraction: float, print_summary: bool) -> tuple[Alice, Bob, float, float]:
-    alice = Alice()
-    alice.generate_key()
-    alice.generate_quantum_state_for_bob2()
-    bob = Bob(alice.send_state_to_bob2())
-    # print(bob.quantum_state)
-    bob.measure_all_qubits()
-    print("start agree key phase")
-    agreed_key(alice, bob)
-    print("start qber calculation phase")
-    estimated_qber, true_qber = calculate_qber(alice, bob, sacrifice_fraction)
-    print("end qber calculation phase")
-    if print_summary:
-        print_quantum_phase_summary(alice, bob, estimated_qber, true_qber)
-    return alice, bob, estimated_qber, true_qber
+######################## Reconciliation Phase - classes and handlers ########################
 
 
 class Block:
@@ -586,6 +592,64 @@ class Cascade:
                 self.binary_algorithm(block)
             st = time.time()
             print(f"end iter {iter_num} time: {st}. Took {st-et}")
+
+
+#####
+
+
+def bb84_quantum_phase(
+    qber_sacrifice_fraction: float, print_mode: Output = Output.NONE, ch_mode: ChannelMode = ChannelMode.NOISY
+) -> tuple[Alice, Bob, Eve, float, float]:
+    eve = Eve() if ch_mode is ChannelMode.EAVESDROPPING else None
+    alice = Alice()
+    alice.generate_key()
+    alice.generate_quantum_state_for_bob()
+
+    sent_state = alice.send_state_to_bob()
+    if ch_mode is ChannelMode.EAVESDROPPING:
+        sent_state, _ = eve.measure_eavesdropped_qubits(sent_state)
+    bob = Bob(sent_state)
+
+    bob.measure_all_qubits()
+    print("start agree key phase")
+    agreed_key(alice, bob, eve)
+    print("start qber calculation phase")
+    estimated_qber, true_qber = calculate_qber(alice, bob, eve, qber_sacrifice_fraction)
+    print("end qber calculation phase")
+    if print_mode is Output.SHORT:
+        print_quantum_phase_summary(alice, bob, estimated_qber, true_qber)
+    return alice, bob, eve, estimated_qber, true_qber
+
+
+def qkd_bb84_algorithm(
+    qber_sacrifice_fraction: float = 0.5,
+    print_mode: Output = Output.NONE,
+    ch_mode: ChannelMode = ChannelMode.NOISY,
+):
+    print_output(Output.EXTEND, print_mode, "start quantum phase")
+    alice, bob, eve, estimated_qber, true_qber = bb84_quantum_phase(
+        qber_sacrifice_fraction, print_mode, ch_mode
+    )
+
+    if ch_mode is ChannelMode.NOISY:
+        print_output(Output.EXTEND, print_mode, "start reconciliation phase (cascade algorithm)")
+        reconciliation = Cascade(alice.key_after_qber, bob.key_after_qber, estimated_qber)
+        reconciliation.cascade()
+    elif ch_mode is ChannelMode.EAVESDROPPING:
+        print(np.average(eve.key_after_qber ^ alice.key_after_qber))
+
+    print(f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}. Final key length: {reconciliation._key_len}")
+    print("**************** quantum bit error rate ****************")
+    print(f"estimated error: {estimated_qber}")
+    print(f"true error: {true_qber}")
+    print(f"reveled bits rate {len(reconciliation._reveled_bits)/ reconciliation._key_len}")
+    print(np.sum(bob.key_after_qber ^ alice.key_after_qber))
+    print(np.sum(np.array(reconciliation._noisy_key) ^ np.array(alice.key_after_qber)))
+
+
+def main():
+    args = cli()
+    qkd_bb84_algorithm(print_mode=False, ch_mode=ChannelMode.NOISY)
 
 
 if __name__ == "__main__":

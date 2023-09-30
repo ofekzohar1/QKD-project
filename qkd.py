@@ -382,25 +382,6 @@ class Eve(Player):
             self.key_reconciliation[i] = bob_key[i]
 
 
-def print_quantum_phase_summary(alice: Alice, bob: Bob, estimated_qber: float, true_qber: float):
-    print(f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}")
-    print("**************** keys ****************")
-    print(f"Alice's key: {alice.key}")
-    print(f"Bob's key: {bob.key}")
-    print("**************** bases ****************")
-    print(f"Alice's encoding bases: {alice.encoding_base}")
-    print(f"Bob's measuring bases: {bob.encoding_base}")
-    print("**************** agreed keys ****************")
-    print(f"Alice's agreed key: {alice.agreed_key}")
-    print(f"Bob's agreed key: {bob.agreed_key}")
-    print("**************** quantum bit error rate ****************")
-    print(f"estimated error: {estimated_qber}")
-    print(f"true error: {true_qber}")
-    print("**************** key after qber calculation ****************")
-    print(f"Alice's agreed key: {alice.key_after_qber}")
-    print(f"Bob's agreed key: {bob.key_after_qber}")
-
-
 ######################## Reconciliation Phase - classes and handlers ########################
 
 
@@ -619,19 +600,85 @@ def fast_binary_to_decimal_modulo(binary: np.ndarray, mod: int) -> int:
 
 
 class BB84:
+    """BB84 class is the main class for the BB84 Algorithm implementation.
+
+    Args:
+        qber_sacrifice_fraction (:obj:`float`): The bit fraction used to estimate the qber. Defaults to 0.5.
+        ch_mode (:obj:`ChannelMode`): The quantum channel mode. Defaults to ChannelMode.NOISY.
+        allowed_key_leak (:obj:`float`): The bit fraction used to perform the PA. Defaults to 2^-32.
+    """
+
     def __init__(
         self,
         qber_sacrifice_fraction: float = 0.5,
         ch_mode: ChannelMode = ChannelMode.NOISY,
         allowed_key_leak: float = 2**-32,
     ):
-        self._ch_mode = ch_mode
-        self._qber_sacrifice_fraction = qber_sacrifice_fraction
-        self._allowed_key_leak = allowed_key_leak
+        self._ch_mode = ch_mode  # The quantum channel mode. Defaults to ChannelMode.NOISY.
 
-        self._alice = None
-        self._bob = None
-        self._Eve = None
+        self._qber_sacrifice_fraction = qber_sacrifice_fraction
+        # float: The bit fraction used to estimate the qber. Defaults to 0.5.
+        self._allowed_key_leak = allowed_key_leak
+        # float: The bit fraction used to perform the PA. Defaults to 2^-32.
+
+        self._alice = None  # Alice: Alice player object
+        self._bob = None  # Bob: Bob player object
+        self._eve = None  # Eve: Eve player object
+
+    def bb84(self):
+        print_output(Output.SHORT, "start quantum phase")
+        estimated_qber, true_qber = self.quantum_phase()
+
+        alice, bob, eve = self._alice, self._bob, self._eve
+        print_output(Output.SHORT, "start reconciliation phase (cascade algorithm)")
+        reconciliation = Cascade(alice.key_after_qber, bob.key_after_qber, estimated_qber)
+        bob.key_reconciliation, reveled_bits = reconciliation.cascade()
+        alice.key_reconciliation = alice.key_after_qber
+
+        if self._ch_mode is ChannelMode.EAVESDROPPING:
+            eve.study_key_from_reconciliation_leak(reveled_bits, bob.key_reconciliation)
+            pa_key_error, pa_key_leak = privacy_amplification(alice, bob, eve, self._allowed_key_leak)
+            print(pa_key_error, pa_key_leak)
+
+        print(
+            f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}. Final key length: {len(bob.key_reconciliation)}"
+        )
+        print("**************** quantum bit error rate ****************")
+        print(f"estimated error: {estimated_qber}")
+        print(f"true error: {true_qber}")
+        print(f"reveled bits rate {len(reveled_bits) / len(bob.key_reconciliation)}")
+        print(np.sum(bob.key_after_qber ^ alice.key_after_qber))
+        print(np.sum(bob.key_reconciliation ^ alice.key_after_qber))
+
+    def quantum_phase(self) -> tuple[float, float]:
+        """The quantum Phase of the BB84 algorithm (step 1-3)
+
+        Returns:
+            tuple[float, float]: The estimated qber (from the sacrificed bits), The true qber (from the remain bits)
+        """
+        print_output(Output.SHORT, "start generate key step")
+        self._eve = Eve() if self._ch_mode is ChannelMode.EAVESDROPPING else None
+        self._alice = Alice()
+        self._alice.generate_key()
+        self._alice.generate_quantum_state_for_bob()
+
+        print_output(Output.SHORT, "start quantum communication step")
+        sent_state = self._alice.send_state_to_bob()
+        if self._ch_mode is ChannelMode.EAVESDROPPING:
+            sent_state, _ = self._eve.measure_eavesdropped_qubits(sent_state)
+        self._bob = Bob(sent_state)
+
+        self._bob.measure_all_qubits()
+
+        print_output(Output.SHORT, "start key agree step")
+        self.agreed_key()
+
+        print_output(Output.SHORT, "start qber calculation step")
+        estimated_qber, true_qber = self.calculate_qber()
+
+        if print_mode is Output.SHORT:
+            self.print_quantum_phase_summary(estimated_qber, true_qber)
+        return estimated_qber, true_qber
 
     def agreed_key(self) -> np.ndarray:
         """The key agreement step. Keep every bit measured (Bob) by the same base were encoded (Alice).
@@ -647,23 +694,18 @@ class BB84:
             self._eve.agreed_key = self._eve.key[same_base_indexes].copy()
         return same_base_indexes
 
-    def calculate_qber(
-        alice: Alice, bob: Bob, eve: Eve = None, sacrifice_fraction: float = 0.5
-    ) -> tuple[float, float]:
+    def calculate_qber(self) -> tuple[float, float]:
         """Calculating the Bob's key quantum bit error rate.
         Alice and Bob randomly chose sacrifice_fraction of the agreed key bits to estimate the error rate.
-
-        Args:
-            alice (Alice): Alice player object
-            bob (Bob): Bob player object
-            eve (Eve, optional): Eve player object. Defaults to None (if no eavesdropping on the channel).
-            sacrifice_fraction (float, optional): The bit fraction used to estimate the qber. Defaults to 0.5.
 
         Returns:
             tuple[float, float]: The estimated qber (from the sacrificed bits), The true qber (from the remain bits)
 
             The true qber made only for compassion and isn't accessible to the Players!
         """
+        alice, bob, eve = self._alice, self._bob, self._eve
+        sacrifice_fraction = self._qber_sacrifice_fraction
+
         key_length = len(alice.agreed_key)
         index_perm = np.random.permutation(key_length)  # Choose random permutation on the key's indexes
         random_sacrifice_bits, remain_bits = (
@@ -685,71 +727,30 @@ class BB84:
             eve.key_after_qber = eve.agreed_key[remain_bits].copy()
         return estimated_qber, true_qber
 
-    def bb84_quantum_phase(self) -> tuple[float, float]:
-        """bb84_quantum_phase _summary_
-
-        Returns:
-            Alice: alice player object
-            Alice: alice player object
-            Alice: alice player object
-
-            tuple[Alice, Bob, Eve, float, float]: _description_
-        """
-        eve = Eve() if self._ch_mode is ChannelMode.EAVESDROPPING else None
-        alice = Alice()
-        alice.generate_key()
-        alice.generate_quantum_state_for_bob()
-
-        sent_state = alice.send_state_to_bob()
-        if self._ch_mode is ChannelMode.EAVESDROPPING:
-            sent_state, _ = eve.measure_eavesdropped_qubits(sent_state)
-        bob = Bob(sent_state)
-
-        bob.measure_all_qubits()
-
-        print("start agree key phase")
-        agreed_key(alice, bob, eve)
-        print("start qber calculation phase")
-        estimated_qber, true_qber = calculate_qber(alice, bob, eve, self._qber_sacrifice_fraction)
-        print("end qber calculation phase", estimated_qber, true_qber)
-        if print_mode is Output.SHORT:
-            print_quantum_phase_summary(alice, bob, estimated_qber, true_qber)
-        return alice, bob, eve, estimated_qber, true_qber
-
-    def qkd_bb84_algorithm(
-        qber_sacrifice_fraction: float = 0.5,
-        ch_mode: ChannelMode = ChannelMode.NOISY,
-        allowed_key_leak: float = 2**-32,
-    ):
-        print_output(Output.SHORT, "start quantum phase")
-        alice, bob, eve, estimated_qber, true_qber = bb84_quantum_phase(
-            qber_sacrifice_fraction, print_mode, ch_mode
-        )
-
-        print_output(Output.SHORT, "start reconciliation phase (cascade algorithm)")
-        reconciliation = Cascade(alice.key_after_qber, bob.key_after_qber, estimated_qber)
-        bob.key_reconciliation, reveled_bits = reconciliation.cascade()
-        alice.key_reconciliation = alice.key_after_qber
-
-        if ch_mode is ChannelMode.EAVESDROPPING:
-            eve.study_key_from_reconciliation_leak(reveled_bits, bob.key_reconciliation)
-            pa_key_error, pa_key_leak = privacy_amplification(alice, bob, eve, allowed_key_leak)
-            print(pa_key_error, pa_key_leak)
-
-        print(
-            f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}. Final key length: {len(bob.key_reconciliation)}"
-        )
+    def print_quantum_phase_summary(self, estimated_qber: float, true_qber: float):
+        alice, bob, eve = self._alice, self._bob, self._eve
+        print(f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}")
+        print("**************** keys ****************")
+        print(f"Alice's key: {alice.key}")
+        print(f"Bob's key: {bob.key}")
+        print("**************** bases ****************")
+        print(f"Alice's encoding bases: {alice.encoding_base}")
+        print(f"Bob's measuring bases: {bob.encoding_base}")
+        print("**************** agreed keys ****************")
+        print(f"Alice's agreed key: {alice.agreed_key}")
+        print(f"Bob's agreed key: {bob.agreed_key}")
         print("**************** quantum bit error rate ****************")
         print(f"estimated error: {estimated_qber}")
         print(f"true error: {true_qber}")
-        print(f"reveled bits rate {len(reveled_bits) / len(bob.key_reconciliation)}")
-        print(np.sum(bob.key_after_qber ^ alice.key_after_qber))
-        print(np.sum(bob.key_reconciliation ^ alice.key_after_qber))
+        print("**************** key after qber calculation ****************")
+        print(f"Alice's agreed key: {alice.key_after_qber}")
+        print(f"Bob's agreed key: {bob.key_after_qber}")
 
 
 def main():
     args = cli()
-    qkd_bb84_algorithm(ch_mode=ChannelMode.EAVESDROPPING)
+    qkd_bb84_algorithm = BB84(ch_mode=ChannelMode.EAVESDROPPING)
+    qkd_bb84_algorithm.bb84()
 
 
 if __name__ == "__main__":

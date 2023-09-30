@@ -6,10 +6,12 @@ import time
 import numpy as np
 from scipy.stats import unitary_group
 
-################################ Constants ################################
+################################ Constants & Globals ################################
 
 NUM_QUBITS = 100000
 NOISE_PROB = 0.125  # 1/8
+
+print_mode = None  # The algorithm output mode
 
 # 1-qubit Gates
 I_GATE = np.array([[1, 0], [0, 1]])
@@ -35,9 +37,8 @@ class Output(Enum):
     """Printing mode for bb84 algorithm"""
 
     NONE = 0
-    GRAPHS = 1
-    SHORT = 2
-    EXTEND = 3
+    SHORT = 1
+    EXTEND = 2
 
     def __str__(self):
         return self.name.lower()
@@ -121,8 +122,8 @@ def fraction_float(x) -> float:
     return x
 
 
-def print_output(required_mode: Output, current_mode: Output, msg: str):
-    if current_mode is required_mode or (required_mode is Output.SHORT and current_mode is Output.EXTEND):
+def print_output(required_mode: Output, msg: str):
+    if print_mode is required_mode or (required_mode is Output.SHORT and print_mode is Output.EXTEND):
         print(msg)
 
 
@@ -147,7 +148,7 @@ class Qubit:
     """The Qubit class represent a 1-qubit state. Initialize as the zero state |0>.
 
     Attributes:
-        state (np.ndarray): The qubit state
+        state (ndarray): The qubit state
     """
 
     def __init__(self) -> None:
@@ -206,21 +207,33 @@ class Qubit:
 
 
 class Player:
-    """Player class represent an abstract party in the BB84 algorithm."""
+    """Player class represent an abstract party in the BB84 algorithm.
+
+    Attributes:
+        key (:obj:`ndarray`): The full original key (before agreement phase)
+        agreed_key (:obj:`ndarray`): The agreed key (after agreement phase)
+        key_after_qber (:obj:`ndarray`): The agreed key after discarding random bits (qber calculation phase)
+        key_reconciliation (:obj:`ndarray`): The agreed key after reconciliation
+        key_privacy_amplification (:obj:`ndarray`): The agreed key after privacy amplification
+        encoding_base (:obj:`ndarray`): The randomized encoding base
+        quantum_state (:obj:`list` of :obj:`Qubit`): The BB84 quantum state
+
+    Args:
+        rnd (any, optional): Random generator object.
+    """
 
     def __init__(self, rnd=None):
         # random generator, if not provided use default_rng()
         self._rnd = rnd if rnd is not None else np.random.default_rng()
 
-        self.key = None  # ndarray: The full original key (before agreement phase)
-        self.agreed_key = None  # ndarray: The agreed key (after agreement phase)
+        self.key = None
+        self.agreed_key = None
         self.key_after_qber = None
-        # ndarray: The agreed key after discarding random bits (qber calculation phase)
-        self.key_reconciliation = None  # ndarray: The agreed key after reconciliation
-        self.key_privacy_amplification = None  # ndarray: The agreed key after privacy amplification
+        self.key_reconciliation = None
+        self.key_privacy_amplification = None
 
-        self.encoding_base = None  # ndarray: The randomized encoding base
-        self.quantum_state = None  # list[Qubit]: The BB84 quantum state
+        self.encoding_base = None
+        self.quantum_state = None
 
 
 class Alice(Player):
@@ -335,7 +348,7 @@ class Eve(Player):
         """Measure the eavesdropped quantum state according to the BREIDBART base.
 
         Args:
-            state (list[Qubit]): The quantum state sent to bob.
+            state (list[Qubit]): The quantum state sent to bob
 
         Returns:
             tuple[list[Qubit], np.ndarray]: The measured state, Eve's measured key
@@ -348,9 +361,9 @@ class Eve(Player):
 
         for i in range(NUM_QUBITS):
             if eavesdropped[i] == 1:
+                # Measure the qubit in the BREIDBART base
                 qubit = self.quantum_state[i]
                 self.key[i] = qubit.measure(BREIDBART_BASE)
-                # Save the measurement (BREIDBART base) result in Eve's key
             else:
                 # Eve can't measure this qubit - flip a toss
                 self.key[i] = self._rnd.integers(2)
@@ -358,14 +371,14 @@ class Eve(Player):
         return self.quantum_state, self.key
 
     def study_key_from_reconciliation_leak(self, revealed_bits: np.ndarray, bob_key: np.ndarray):
-        """The bits eve learned from the bits leaked during the reconciliation process (unsecure channel)
+        """The bits eve learned from the leakage during the reconciliation process (unsecure channel)
 
         Args:
-            revealed_bits (np.ndarray): _description_
-            bob_key (np.ndarray): _description_
+            revealed_bits (np.ndarray): The bits index reveled during the reconciliation process
+            bob_key (np.ndarray): Bob's key after reconciliation
         """
         self.key_reconciliation = self.key_after_qber.copy()
-        for i in revealed_bits:
+        for i in revealed_bits:  # copy all leaked bits from bob's key
             self.key_reconciliation[i] = bob_key[i]
 
 
@@ -388,147 +401,184 @@ def print_quantum_phase_summary(alice: Alice, bob: Bob, estimated_qber: float, t
     print(f"Bob's agreed key: {bob.key_after_qber}")
 
 
-def agreed_key(alice: Alice, bob: Bob, eve: Eve = None) -> np.ndarray:
-    same_base_indexes = np.where(alice.encoding_base == bob.encoding_base)[0]
-
-    alice.agreed_key = alice.key[same_base_indexes].copy()
-    bob.agreed_key = bob.key[same_base_indexes].copy()
-    if eve is not None:
-        eve.agreed_key = eve.key[same_base_indexes].copy()
-    return same_base_indexes
-
-
-def calculate_qber(
-    alice: Alice, bob: Bob, eve: Eve = None, sacrifice_fraction: float = 0.5
-) -> tuple[float, float]:
-    key_length = len(alice.agreed_key)
-    index_perm = np.random.permutation(key_length)
-    random_sacrifice_bits, remain_bits = (
-        index_perm[: ceil(sacrifice_fraction * key_length)],
-        index_perm[ceil(sacrifice_fraction * key_length) :],
-    )
-
-    alice_key, bob_key = alice.agreed_key, bob.agreed_key
-    estimated_qber = np.average(alice_key[random_sacrifice_bits] ^ bob_key[random_sacrifice_bits])
-    alice.key_after_qber, bob.key_after_qber = alice_key[remain_bits], bob_key[remain_bits]
-    true_qber = np.average(alice.key_after_qber ^ bob.key_after_qber)
-    if eve is not None:
-        eve.key_after_qber = eve.agreed_key[remain_bits].copy()
-    return estimated_qber, true_qber
-
-
 ######################## Reconciliation Phase - classes and handlers ########################
 
 
 class Block:
-    def __init__(self, start_index: int, end_index: int, iter_num: int) -> None:
-        self._start_index = start_index
-        self._end_index = end_index
-        self._iter = iter_num
-        self._parity = None
+    """Block class represent a block (sequential) of key bits for the use of the Cascade and Binary algorithms.
 
-    def get_sub_blocks(self):
-        mid_index = ceil((self._start_index + self._end_index) / 2)
-        left_sub_block = Block(start_index=self._start_index, end_index=mid_index, iter_num=self._iter)
-        right_sub_block = Block(start_index=mid_index, end_index=self._end_index, iter_num=self._iter)
+    Attributes:
+        start_index (:obj:`int`): The start index of the block
+        end_index (:obj:`int`): The ebd index of the block (end index is excluded like in Range)
+        iter (ndarray): The iteration number (of the Cascade algorithm) the block belongs to.
+            Used for considering the right key permutation.
+        parity (int): The one's parity of the block
+
+    Args:
+        start_index (:obj:`int`): The provided start index of the block
+        end_index (:obj:`int`): The provided end index of the block
+        iter_num (:obj:`int`): The provided iteration number
+    """
+
+    def __init__(self, start_index: int, end_index: int, iter_num: int):
+        self.start_index = start_index
+        self.end_index = end_index
+        self.iter = iter_num
+        self.parity = None
+
+    def get_sub_blocks(self) -> tuple:
+        """Split the block in the middle (if odd length the left sub block is bigger by one)
+
+        Returns:
+            tuple[Block, Block]: The left and right sub blocks
+        """
+        mid_index = ceil((self.start_index + self.end_index) / 2)
+        left_sub_block = Block(start_index=self.start_index, end_index=mid_index, iter_num=self.iter)
+        right_sub_block = Block(start_index=mid_index, end_index=self.end_index, iter_num=self.iter)
         return left_sub_block, right_sub_block
 
     @property
-    def parity(self):
-        return self._parity
-
-    @parity.setter
-    def parity(self, value: int):
-        self._parity = value
-
-    @property
-    def start_index(self):
-        return self._start_index
-
-    @property
-    def end_index(self):
-        return self._end_index
-
-    @property
-    def iter(self):
-        return self._iter
-
-    @property
     def size(self):
-        return self._end_index - self._start_index
+        """int: The block size (length)"""
+        return self.end_index - self.start_index
 
 
 class Cascade:
-    def __init__(self, true_key: list[int], noisy_key: list[int], qber: float, iterations: int = 4):
-        self._key_len = len(true_key)
-        self._true_key = true_key.copy()
-        self._noisy_key = noisy_key.copy()
-        self._qber = max(qber, 1 / self._key_len)
-        self._iterations = iterations
-        self._shuffles = []
-        self._index_to_blocks = [[] for i in range(self._key_len)]
-        self._odd_block_queue = []
-        self._reveled_bits = []
+    """Cascade class is the main class for the Cascade Algorithm implementation.
 
-    def calculate_block_size(self, iter_num: int) -> int:
+    The implementation details taken from: https://cascade-python.readthedocs.io/en/latest/protocol.html
+
+    Args:
+        true_key (:obj:`ndarray`): The provided correct key
+        noisy_key (:obj:`ndarray`): The provided noisy key bits to be reconciliated
+        qber (:obj:`float`): The estimated noisy key qber
+        iterations (:obj:`int`): The number of Cascade iterations. Default to 4.
+    """
+
+    def __init__(self, true_key: np.ndarray, noisy_key: np.ndarray, qber: float, iterations: int = 4):
+        self._key_len = len(true_key)  # int: The key length
+        self._true_key = true_key.copy()  # ndarray: The correct key bits
+        self._noisy_key = noisy_key.copy()  # ndarray: The noisy key bits to be reconciliated
+        self._qber = max(qber, 1 / self._key_len)  # int: The noisy key qber, set minimum to 1/key_len
+        self._iterations = iterations  # int: Number of Cascade iterations
+
+        self._shuffles = []  # list[ndarray]: list of index permutations for each iteration
+        self._index_to_blocks = [[] for _ in range(self._key_len)]  # Linked blocks to key indexes
+        self._odd_block_queue = []  # The odd parity queue - mark blocks to be reconciliated
+        self._reveled_bits = []  # bits revealed (leaked) by the algorithm (unsecure channel)
+
+    def _calculate_block_size(self, iter_num: int) -> int:
+        """Calculate the Cascade top-level block size according to the given iteration
+
+        Args:
+            iter_num (int): The iteration number
+
+        Returns:
+            int: The Cascade top-level block size
+        """
         return ceil(0.73 / self._qber) * 2**iter_num
 
-    def bit_flip(self, index: int):
+    def _bit_flip(self, index: int):
+        """Flipping a bit key value in the given index.
+
+        All the index's linked blocks are also flipped (if already calculated).
+        The new odd parity blocks are marked for "Cascading" (queued up).
+
+        Args:
+            index (int): The index of the bit to be flipped
+        """
         self._noisy_key[index] ^= 1
-        for block in self._index_to_blocks[index]:
-            if block.parity is not None:
+        for block in self._index_to_blocks[index]:  # The blocks registered with the current index
+            if block.parity is not None:  # parity already calculated
                 block.parity ^= 1
-                if block.parity == 1:
+                if block.parity == 1:  # If odd parity block - queue up!
                     self._odd_block_queue.append(block)
 
     def binary_algorithm(self, block: Block):
+        """The binary algorithm implementation (recovering one odd parity block error).
+
+        Args:
+            block (Block): The Cascade top-level odd parity block
+        """
         if block.parity == 0:
+            # Make sure it's an odd parity block (can change since queued because of bit flipping)
             return
-        if block.size == 1:
-            index = self._shuffles[block.iter][block.start_index]
-            self._reveled_bits.append(index)
-            self.bit_flip(index)
-        else:
+
+        if block.size == 1:  # Recursion stop condition, recover the error 0 bit flip
+            index = self._shuffles[block.iter][block.start_index]  # find the original key index
+            self._reveled_bits.append(index)  # Reveled bit index, add to list
+            self._bit_flip(index)  # correct the bit value
+        else:  # recursion step
             left_sub_block, right_sub_block = block.get_sub_blocks()
-            if self.calculate_block_parity(left_sub_block) == 1:
-                right_sub_block.parity = 0
+            if self._calculate_block_parity(left_sub_block) == 1:  # Left sub block is odd parity
+                right_sub_block.parity = 0  # Right sub block must be even parity
                 self.binary_algorithm(left_sub_block)
-            else:
-                right_sub_block.parity = 1
+            else:  # Left sub block is even parity
+                right_sub_block.parity = 1  # Right sub block must be odd parity
                 self.binary_algorithm(right_sub_block)
 
-    def calculate_block_parity(self, block: Block):
-        if block.parity is None:
+    def _calculate_block_parity(self, block: Block) -> int:
+        """Calculate the given block parity (if not calculated before). If already calculated return block.parity immediately
+
+        Args:
+            block (Block): _description_
+
+        Returns:
+            int: The block parity
+        """
+        if block.parity is None:  # Not calculated yet
             noisy_block_parity, true_block_parity = 0, 0
             shuffle = self._shuffles[block.iter]
-            for index in range(block.start_index, block.end_index):
+            for index in range(block.start_index, block.end_index):  # iterate over the block indexes
                 non_shuffled_index = shuffle[index]
                 noisy_block_parity ^= self._noisy_key[non_shuffled_index]  # Bob
                 true_block_parity ^= self._true_key[non_shuffled_index]  # Alice
+
+                # register the block to be linked with non_shuffled_index
                 self._index_to_blocks[non_shuffled_index].append(block)
-            block.parity = noisy_block_parity ^ true_block_parity
+
+            block.parity = noisy_block_parity ^ true_block_parity  # Parity between corrected and noisy key
+
         return block.parity
 
-    def cascade(self):
-        shuffle = range(self._key_len)
-        for iter_num in range(self._iterations):
-            et = time.time()
-            print(f"start iter {iter_num} time: {et}")
-            # print(f"noisy key iter {iter_num}: {self._noisy_key}")
-            if iter_num != 0:
+    def cascade(self) -> tuple[np.ndarray, list[int]]:
+        """The main Cascade algorithm implementation.
+
+        Using a blocks queue to gain the "Cascade" effect.
+
+        Returns:
+            np.ndarray: The reconciliated key
+            list[int]: The reveled bits indexes
+        """
+        shuffle = range(self._key_len)  # 1st shuffle == the identity permutation
+
+        for iter_num in range(self._iterations):  # Main Cascade loop iteration
+            start_iter_time = time.time()
+            print_output(Output.SHORT, f"start iter {iter_num} time: {start_iter_time}")
+
+            if iter_num != 0:  # If not the 1st iteration, shuffle the key
                 shuffle = np.random.permutation(self._key_len)
-            self._shuffles.append(shuffle)
-            block_size = self.calculate_block_size(iter_num)
-            for start_block in range(0, self._key_len, block_size):
+            self._shuffles.append(shuffle)  # Save the shuffle permutation for later use
+
+            block_size = self._calculate_block_size(iter_num)  # Calculate top-level block size
+
+            for start_block in range(0, self._key_len, block_size):  # Divide the shuffled key to blocks
                 end_block = min(self._key_len, start_block + block_size)
                 block = Block(start_block, end_block, iter_num)
-                if self.calculate_block_parity(block) == 1:
+                if self._calculate_block_parity(block) == 1:
+                    # Mark as odd parity block (add to queue)
                     self._odd_block_queue.append(block)
-            while len(self._odd_block_queue) != 0:
+
+            while len(self._odd_block_queue) != 0:  # Run binary algorithm on odd parity blocks
                 block = self._odd_block_queue.pop(0)
                 self.binary_algorithm(block)
-            st = time.time()
-            print(f"end iter {iter_num} time: {st}. Took {st-et}")
+
+            end_iter_time = time.time()
+            print_output(
+                Output.SHORT,
+                f"end iter {iter_num} time: {end_iter_time}. Took {end_iter_time-start_iter_time}",
+            )
+
         return self._noisy_key, self._reveled_bits
 
 
@@ -568,59 +618,133 @@ def fast_binary_to_decimal_modulo(binary: np.ndarray, mod: int) -> int:
 #####
 
 
-def bb84_quantum_phase(
-    qber_sacrifice_fraction: float, print_mode: Output = Output.NONE, ch_mode: ChannelMode = ChannelMode.NOISY
-) -> tuple[Alice, Bob, Eve, float, float]:
-    eve = Eve() if ch_mode is ChannelMode.EAVESDROPPING else None
-    alice = Alice()
-    alice.generate_key()
-    alice.generate_quantum_state_for_bob()
+class BB84:
+    def __init__(
+        self,
+        qber_sacrifice_fraction: float = 0.5,
+        ch_mode: ChannelMode = ChannelMode.NOISY,
+        allowed_key_leak: float = 2**-32,
+    ):
+        self._ch_mode = ch_mode
+        self._qber_sacrifice_fraction = qber_sacrifice_fraction
+        self._allowed_key_leak = allowed_key_leak
 
-    sent_state = alice.send_state_to_bob()
-    if ch_mode is ChannelMode.EAVESDROPPING:
-        sent_state, _ = eve.measure_eavesdropped_qubits(sent_state)
-    bob = Bob(sent_state)
+        self._alice = None
+        self._bob = None
+        self._Eve = None
 
-    bob.measure_all_qubits()
+    def agreed_key(self) -> np.ndarray:
+        """The key agreement step. Keep every bit measured (Bob) by the same base were encoded (Alice).
 
-    print("start agree key phase")
-    agreed_key(alice, bob, eve)
-    print("start qber calculation phase")
-    estimated_qber, true_qber = calculate_qber(alice, bob, eve, qber_sacrifice_fraction)
-    print("end qber calculation phase", estimated_qber, true_qber)
-    if print_mode is Output.SHORT:
-        print_quantum_phase_summary(alice, bob, estimated_qber, true_qber)
-    return alice, bob, eve, estimated_qber, true_qber
+        Returns:
+            np.ndarray: The indexes Alice & Bob agrees on (same encoding base)
+        """
+        same_base_indexes = np.where(self._alice.encoding_base == self._bob.encoding_base)[0]
 
+        self._alice.agreed_key = self._alice.key[same_base_indexes].copy()
+        self._bob.agreed_key = self._bob.key[same_base_indexes].copy()
+        if self._eve is not None:
+            self._eve.agreed_key = self._eve.key[same_base_indexes].copy()
+        return same_base_indexes
 
-def qkd_bb84_algorithm(
-    qber_sacrifice_fraction: float = 0.5,
-    print_mode: Output = Output.NONE,
-    ch_mode: ChannelMode = ChannelMode.NOISY,
-    allowed_key_leak: float = 2**-32,
-):
-    print_output(Output.EXTEND, print_mode, "start quantum phase")
-    alice, bob, eve, estimated_qber, true_qber = bb84_quantum_phase(
-        qber_sacrifice_fraction, print_mode, ch_mode
-    )
+    def calculate_qber(
+        alice: Alice, bob: Bob, eve: Eve = None, sacrifice_fraction: float = 0.5
+    ) -> tuple[float, float]:
+        """Calculating the Bob's key quantum bit error rate.
+        Alice and Bob randomly chose sacrifice_fraction of the agreed key bits to estimate the error rate.
 
-    print_output(Output.EXTEND, print_mode, "start reconciliation phase (cascade algorithm)")
-    reconciliation = Cascade(alice.key_after_qber, bob.key_after_qber, estimated_qber)
-    bob.key_reconciliation, reveled_bits = reconciliation.cascade()
-    alice.key_reconciliation = alice.key_after_qber
+        Args:
+            alice (Alice): Alice player object
+            bob (Bob): Bob player object
+            eve (Eve, optional): Eve player object. Defaults to None (if no eavesdropping on the channel).
+            sacrifice_fraction (float, optional): The bit fraction used to estimate the qber. Defaults to 0.5.
 
-    if ch_mode is ChannelMode.EAVESDROPPING:
-        eve.study_key_from_reconciliation_leak(reveled_bits, bob.key_reconciliation)
-        pa_key_error, pa_key_leak = privacy_amplification(alice, bob, eve, allowed_key_leak)
-        print(pa_key_error, pa_key_leak)
+        Returns:
+            tuple[float, float]: The estimated qber (from the sacrificed bits), The true qber (from the remain bits)
 
-    print(f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}. Final key length: {len(bob.key_reconciliation)}")
-    print("**************** quantum bit error rate ****************")
-    print(f"estimated error: {estimated_qber}")
-    print(f"true error: {true_qber}")
-    print(f"reveled bits rate {len(reveled_bits) / len(bob.key_reconciliation)}")
-    print(np.sum(bob.key_after_qber ^ alice.key_after_qber))
-    print(np.sum(bob.key_reconciliation ^ alice.key_after_qber))
+            The true qber made only for compassion and isn't accessible to the Players!
+        """
+        key_length = len(alice.agreed_key)
+        index_perm = np.random.permutation(key_length)  # Choose random permutation on the key's indexes
+        random_sacrifice_bits, remain_bits = (
+            # The first sacrifice_fraction bits selected for revealing
+            index_perm[: ceil(sacrifice_fraction * key_length)],
+            index_perm[ceil(sacrifice_fraction * key_length) :],  # The remain indexes are the unraveled bits
+        )
+
+        alice_key, bob_key = alice.agreed_key, bob.agreed_key
+        # Average over the different bits
+        estimated_qber = np.average(alice_key[random_sacrifice_bits] ^ bob_key[random_sacrifice_bits])
+
+        # Discard all reveled bits from the key
+        alice.key_after_qber, bob.key_after_qber = alice_key[remain_bits], bob_key[remain_bits]
+
+        # Calculate the qber over the remain bits (inaccessible to the players)
+        true_qber = np.average(alice.key_after_qber ^ bob.key_after_qber)
+        if eve is not None:  # If Eve on the channel, she also discard the reveled bits
+            eve.key_after_qber = eve.agreed_key[remain_bits].copy()
+        return estimated_qber, true_qber
+
+    def bb84_quantum_phase(self) -> tuple[float, float]:
+        """bb84_quantum_phase _summary_
+
+        Returns:
+            Alice: alice player object
+            Alice: alice player object
+            Alice: alice player object
+
+            tuple[Alice, Bob, Eve, float, float]: _description_
+        """
+        eve = Eve() if self._ch_mode is ChannelMode.EAVESDROPPING else None
+        alice = Alice()
+        alice.generate_key()
+        alice.generate_quantum_state_for_bob()
+
+        sent_state = alice.send_state_to_bob()
+        if self._ch_mode is ChannelMode.EAVESDROPPING:
+            sent_state, _ = eve.measure_eavesdropped_qubits(sent_state)
+        bob = Bob(sent_state)
+
+        bob.measure_all_qubits()
+
+        print("start agree key phase")
+        agreed_key(alice, bob, eve)
+        print("start qber calculation phase")
+        estimated_qber, true_qber = calculate_qber(alice, bob, eve, self._qber_sacrifice_fraction)
+        print("end qber calculation phase", estimated_qber, true_qber)
+        if print_mode is Output.SHORT:
+            print_quantum_phase_summary(alice, bob, estimated_qber, true_qber)
+        return alice, bob, eve, estimated_qber, true_qber
+
+    def qkd_bb84_algorithm(
+        qber_sacrifice_fraction: float = 0.5,
+        ch_mode: ChannelMode = ChannelMode.NOISY,
+        allowed_key_leak: float = 2**-32,
+    ):
+        print_output(Output.SHORT, "start quantum phase")
+        alice, bob, eve, estimated_qber, true_qber = bb84_quantum_phase(
+            qber_sacrifice_fraction, print_mode, ch_mode
+        )
+
+        print_output(Output.SHORT, "start reconciliation phase (cascade algorithm)")
+        reconciliation = Cascade(alice.key_after_qber, bob.key_after_qber, estimated_qber)
+        bob.key_reconciliation, reveled_bits = reconciliation.cascade()
+        alice.key_reconciliation = alice.key_after_qber
+
+        if ch_mode is ChannelMode.EAVESDROPPING:
+            eve.study_key_from_reconciliation_leak(reveled_bits, bob.key_reconciliation)
+            pa_key_error, pa_key_leak = privacy_amplification(alice, bob, eve, allowed_key_leak)
+            print(pa_key_error, pa_key_leak)
+
+        print(
+            f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}. Final key length: {len(bob.key_reconciliation)}"
+        )
+        print("**************** quantum bit error rate ****************")
+        print(f"estimated error: {estimated_qber}")
+        print(f"true error: {true_qber}")
+        print(f"reveled bits rate {len(reveled_bits) / len(bob.key_reconciliation)}")
+        print(np.sum(bob.key_after_qber ^ alice.key_after_qber))
+        print(np.sum(bob.key_reconciliation ^ alice.key_after_qber))
 
 
 def main():

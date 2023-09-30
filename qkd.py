@@ -1,18 +1,14 @@
-from concurrent.futures import ProcessPoolExecutor
 from enum import Enum
 import argparse
-from math import ceil, pi
+from math import ceil, pi, floor
 import random
 import time
 import numpy as np
 from scipy.stats import unitary_group
 
-# TODO: consider bitarray instead of int
-
 ################################ Constants ################################
 
-NUM_QUBITS = 20
-PARALLELIZATION_THRESHOLD = 20
+NUM_QUBITS = 100000
 NOISE_PROB = 0.125  # 1/8
 
 # 1-qubit Gates
@@ -216,46 +212,15 @@ class Player:
         # random generator, if not provided use default_rng()
         self._rnd = rnd if rnd is not None else np.random.default_rng()
 
-        self._key = None  # ndarray: The full original key (before agreement phase)
-        self._agreed_key = None  # ndarray: The agreed key (after agreement phase)
-        self._key_after_qber = None
+        self.key = None  # ndarray: The full original key (before agreement phase)
+        self.agreed_key = None  # ndarray: The agreed key (after agreement phase)
+        self.key_after_qber = None
         # ndarray: The agreed key after discarding random bits (qber calculation phase)
+        self.key_reconciliation = None  # ndarray: The agreed key after reconciliation
+        self.key_privacy_amplification = None  # ndarray: The agreed key after privacy amplification
 
-        self._encoding_base = None  # ndarray: The randomized encoding base
-        self._quantum_state = None  # list[Qubit]: The BB84 quantum state
-
-    @property
-    def key(self) -> np.ndarray:
-        """ndarray: The full original key (before agreement phase)."""
-        return self._key
-
-    @property
-    def agreed_key(self) -> np.ndarray:
-        """ndarray: The agreed key (after agreement phase)."""
-        return self._agreed_key
-
-    @agreed_key.setter
-    def agreed_key(self, value: list):
-        self._agreed_key = value
-
-    @property
-    def key_after_qber(self) -> np.ndarray:
-        """ndarray: The agreed key after discarding random bits (qber calculation phase)"""
-        return self._key_after_qber
-
-    @key_after_qber.setter
-    def key_after_qber(self, value: np.ndarray):
-        self._key_after_qber = value
-
-    @property
-    def encoding_bases(self) -> np.ndarray:
-        """ndarray: The randomized encoding base"""
-        return self._encoding_base
-
-    @property
-    def quantum_state(self) -> list[Qubit]:
-        """list[Qubit]: The BB84 quantum state"""
-        return self._quantum_state
+        self.encoding_base = None  # ndarray: The randomized encoding base
+        self.quantum_state = None  # list[Qubit]: The BB84 quantum state
 
 
 class Alice(Player):
@@ -267,7 +232,7 @@ class Alice(Player):
 
     def __init__(self, rnd=None):
         Player.__init__(self, rnd)
-        self._quantum_state = [Qubit() for _ in range(NUM_QUBITS)]  # Init the |00...0> state
+        self.quantum_state = [Qubit() for _ in range(NUM_QUBITS)]  # Init the |00...0> state
 
     def generate_key(self) -> np.ndarray:
         """Randomly generate key (bits). Key length is NUM_QUBITS.
@@ -275,13 +240,11 @@ class Alice(Player):
         Returns:
             np.ndarray: The generated key
         """
-        self._key = self._rnd.integers(2, size=NUM_QUBITS)
-        return self._key
+        self.key = self._rnd.integers(2, size=NUM_QUBITS)
+        return self.key
 
     def generate_quantum_state_for_bob(self) -> list[Qubit]:
         """Generate quantum state according to alice's key in randomized encoding base.
-
-        If key length is over the PARALLELIZATION THRESHOLD, break the encoding process to multiprocessors task.
 
         encoding states:
             |0> - encoding the zero bit in Z base.
@@ -295,36 +258,23 @@ class Alice(Player):
         Returns:
             list[Qubit]: The generated quantum state.
         """
-        self._encoding_base = self._rnd.integers(2, size=NUM_QUBITS)  # Choose encoding base randomly
+        self.encoding_base = self._rnd.integers(2, size=NUM_QUBITS)  # Choose encoding base randomly
 
-        def task(index: int) -> Qubit:  # Encoding one key bit into 1-qubit state
-            base = self._encoding_base[index]
-            key_bit = self._key[index]
-            qubit = self._quantum_state[index]
-            if key_bit == 1:
+        for i in range(NUM_QUBITS):
+            base = self.encoding_base[i]
+            key_bit = self.key[i]
+            qubit = self.quantum_state[i]
+            if key_bit == 1:  # Rotation |0> to |1>
                 qubit.apply_gate(X_GATE)
-            if base == Base.X.value:
+            if base == Base.X.value:  # Encode in the X base -> apply Hadamard gate
                 qubit.apply_gate(H_GATE)
-            print(qubit)
-            return qubit
 
-        if NUM_QUBITS < PARALLELIZATION_THRESHOLD:
-            # Small key, multiprocessing overhead is too expensive
-            # Iterate sequently over all bits
-            for i in range(NUM_QUBITS):
-                task(i)
-        else:  # multiprocessing the task to simulate quantum parallelism
-            with ProcessPoolExecutor() as pool:
-                pool.map(task, range(NUM_QUBITS), chunksize=NUM_QUBITS)
-
-        return self._quantum_state
+        return self.quantum_state
 
     def send_state_to_bob(self, mode: ChannelMode = ChannelMode.NOISY) -> list[Qubit]:
         """Send state to Bob over the quantum channel.
 
         Noisy channel -> There is NOISE_PROB chance for every qubit to get noisy (arbitrary unitary rotation)
-
-        If key length is over the PARALLELIZATION THRESHOLD, break the process to multiprocessors task.
 
         Args:
             mode (ChannelMode, optional): The Quantum channel mode. Defaults to ChannelMode.NOISY.
@@ -333,29 +283,15 @@ class Alice(Player):
             list[Qubit]: _description_
         """
         if mode is ChannelMode.NOISY:  # Noise on the quantum channel
-            self._noisy_channel()
+            # There is NOISE_PROB chance for every qubit to get noisy
+            noise = self._rnd.choice([0, 1], size=NUM_QUBITS, p=[1 - NOISE_PROB, NOISE_PROB])
+            noise_indexes = np.where(noise == 1)[0]
 
-        return self._quantum_state
+            for index in noise_indexes:  # Apply arbitrary unitary rotation
+                u_noise = unitary_group.rvs(2)
+                self.quantum_state[index].apply_gate(u_noise)
 
-    def _noisy_channel(self):
-        """Noisy channel handler"""
-
-        # There is NOISE_PROB chance for every qubit to get noisy
-        noise = self._rnd.choice([0, 1], size=NUM_QUBITS, p=[1 - NOISE_PROB, NOISE_PROB])
-        noise_indexes = np.where(noise == 1)[0]
-
-        def task(index: int):  # Apply arbitrary unitary rotation
-            u_noise = unitary_group.rvs(2)
-            self._quantum_state[index].apply_gate(u_noise)
-
-        if NUM_QUBITS < PARALLELIZATION_THRESHOLD:
-            # Small key, multiprocessing overhead is too expensive
-            # Iterate sequently over all bits
-            for i in noise_indexes:
-                task(i)
-        else:  # multiprocessing the task to simulate quantum parallelism
-            with ProcessPoolExecutor() as pool:
-                pool.map(task, noise_indexes, chunksize=NUM_QUBITS)
+        return self.quantum_state
 
 
 class Bob(Player):
@@ -368,7 +304,7 @@ class Bob(Player):
 
     def __init__(self, state: list[Qubit], rnd=None):
         Player.__init__(self, rnd)
-        self._quantum_state = state
+        self.quantum_state = state
 
     def measure_all_qubits(self) -> np.ndarray:
         """Measure the received quantum state according to guessed encoding bases (randomized).
@@ -376,60 +312,61 @@ class Bob(Player):
         Returns:
             np.ndarray: The measured key (bits)
         """
-        self._encoding_base = self._rnd.integers(2, size=NUM_QUBITS)  # Guess Alice's encoding base randomly
-        self._key = np.zeros_like(self._encoding_base)  # Create an "empty" key with the correct length
+        self.encoding_base = self._rnd.integers(2, size=NUM_QUBITS)  # Guess Alice's encoding base randomly
+        self.key = np.zeros_like(self.encoding_base)  # Create an "empty" key with the correct length
 
-        def task(index: int):  # Measure 1-qubit state in the guessed base
-            base = self._encoding_base[index]
-            qubit = self._quantum_state[index]
-            if base is Base.X:
+        for i in range(NUM_QUBITS):
+            # Measure 1-qubit state in the guessed base
+            base = self.encoding_base[i]
+            qubit = self.quantum_state[i]
+            if base == Base.X.value:
                 res = qubit.measure(X_BASE_STATES)
             else:
                 res = qubit.measure()
-            self._key[index] = res  # Save the measurement result in Bob's key
+            self.key[i] = res  # Save the measurement result in Bob's key
 
-        if NUM_QUBITS < PARALLELIZATION_THRESHOLD:
-            # Small key, multiprocessing overhead is too expensive
-            # Iterate sequently over all bits
-            for i in range(NUM_QUBITS):
-                task(i)
-        else:  # multiprocessing the task to simulate quantum parallelism
-            with ProcessPoolExecutor() as pool:
-                pool.map(task, range(NUM_QUBITS), chunksize=NUM_QUBITS)
-
-        return self._key
+        return self.key
 
 
 class Eve(Player):
-    """Eve class represent an eavesdropper on the quantum channel of the BB84 algorithm.
-
-    Args:
-        state (list[Qubit]): The quantum state sent to bob.
-    """
+    """Eve class represent an eavesdropper on the quantum channel of the BB84 algorithm."""
 
     def measure_eavesdropped_qubits(self, state: list[Qubit]) -> tuple[list[Qubit], np.ndarray]:
         """Measure the eavesdropped quantum state according to the BREIDBART base.
 
+        Args:
+            state (list[Qubit]): The quantum state sent to bob.
+
         Returns:
-            np.ndarray: The measured key (bits)
+            tuple[list[Qubit], np.ndarray]: The measured state, Eve's measured key
         """
-        self._quantum_state = state
-        self._key = np.zeros(NUM_QUBITS)  # Create an "empty" key with the correct length
+        self.quantum_state = state
+        self.key = np.zeros(NUM_QUBITS, dtype=int)  # Create an "empty" key with the correct length
 
-        def task(index: int):  # Measure 1-qubit state in the BREIDBART base
-            qubit = self._quantum_state[index]
-            self._key[index] = qubit.measure(BREIDBART_BASE)  # Save the measurement result in Eve's key
+        # There is NOISE_PROB chance for every qubit to get measured by eve
+        eavesdropped = self._rnd.choice([0, 1], size=NUM_QUBITS, p=[1 - NOISE_PROB, NOISE_PROB])
 
-        if NUM_QUBITS < PARALLELIZATION_THRESHOLD:
-            # Small key, multiprocessing overhead is too expensive
-            # Iterate sequently over all bits
-            for i in range(NUM_QUBITS):
-                task(i)
-        else:  # multiprocessing the task to simulate quantum parallelism
-            with ProcessPoolExecutor() as pool:
-                pool.map(task, range(NUM_QUBITS), chunksize=NUM_QUBITS)
+        for i in range(NUM_QUBITS):
+            if eavesdropped[i] == 1:
+                qubit = self.quantum_state[i]
+                self.key[i] = qubit.measure(BREIDBART_BASE)
+                # Save the measurement (BREIDBART base) result in Eve's key
+            else:
+                # Eve can't measure this qubit - flip a toss
+                self.key[i] = self._rnd.integers(2)
 
-        return self._quantum_state, self._key
+        return self.quantum_state, self.key
+
+    def study_key_from_reconciliation_leak(self, revealed_bits: np.ndarray, bob_key: np.ndarray):
+        """The bits eve learned from the bits leaked during the reconciliation process (unsecure channel)
+
+        Args:
+            revealed_bits (np.ndarray): _description_
+            bob_key (np.ndarray): _description_
+        """
+        self.key_reconciliation = self.key_after_qber.copy()
+        for i in revealed_bits:
+            self.key_reconciliation[i] = bob_key[i]
 
 
 def print_quantum_phase_summary(alice: Alice, bob: Bob, estimated_qber: float, true_qber: float):
@@ -438,8 +375,8 @@ def print_quantum_phase_summary(alice: Alice, bob: Bob, estimated_qber: float, t
     print(f"Alice's key: {alice.key}")
     print(f"Bob's key: {bob.key}")
     print("**************** bases ****************")
-    print(f"Alice's encoding bases: {alice.encoding_bases}")
-    print(f"Bob's measuring bases: {bob.encoding_bases}")
+    print(f"Alice's encoding bases: {alice.encoding_base}")
+    print(f"Bob's measuring bases: {bob.encoding_base}")
     print("**************** agreed keys ****************")
     print(f"Alice's agreed key: {alice.agreed_key}")
     print(f"Bob's agreed key: {bob.agreed_key}")
@@ -452,7 +389,7 @@ def print_quantum_phase_summary(alice: Alice, bob: Bob, estimated_qber: float, t
 
 
 def agreed_key(alice: Alice, bob: Bob, eve: Eve = None) -> np.ndarray:
-    same_base_indexes = np.where(alice.encoding_bases == bob.encoding_bases)[0]
+    same_base_indexes = np.where(alice.encoding_base == bob.encoding_base)[0]
 
     alice.agreed_key = alice.key[same_base_indexes].copy()
     bob.agreed_key = bob.key[same_base_indexes].copy()
@@ -473,8 +410,8 @@ def calculate_qber(
 
     alice_key, bob_key = alice.agreed_key, bob.agreed_key
     estimated_qber = np.average(alice_key[random_sacrifice_bits] ^ bob_key[random_sacrifice_bits])
-    true_qber = np.average(alice_key ^ bob_key)
     alice.key_after_qber, bob.key_after_qber = alice_key[remain_bits], bob_key[remain_bits]
+    true_qber = np.average(alice.key_after_qber ^ bob.key_after_qber)
     if eve is not None:
         eve.key_after_qber = eve.agreed_key[remain_bits].copy()
     return estimated_qber, true_qber
@@ -592,6 +529,40 @@ class Cascade:
                 self.binary_algorithm(block)
             st = time.time()
             print(f"end iter {iter_num} time: {st}. Took {st-et}")
+        return self._noisy_key, self._reveled_bits
+
+
+####
+
+
+def privacy_amplification(alice: Alice, bob: Bob, eve: Eve, allowed_key_leak: int):
+    new_key_length = floor(-np.log2(allowed_key_leak))  # The allowed leak is 2^-m when m is the new length
+    hash_random_binary = np.random.default_rng().integers(2, size=len(alice.key_reconciliation))
+    # The hash random value in binary repr
+    hash_random_value = fast_binary_to_decimal_modulo(hash_random_binary, 2**new_key_length)
+    for player in [alice, bob, eve]:
+        player.key_privacy_amplification = universal_hash_extractor(
+            player.key_reconciliation, hash_random_value, new_key_length
+        )
+    eve_advantage_before_amp = 1 - np.average(alice.key_reconciliation ^ eve.key_reconciliation)
+    eve_advantage_after_amp = 1 - np.average(alice.key_privacy_amplification ^ eve.key_privacy_amplification)
+    return eve_advantage_before_amp, eve_advantage_after_amp
+
+
+def universal_hash_extractor(key: np.ndarray, hash_random: int, hash_length: int):
+    hash_mod = 2**hash_length
+    new_key_value = fast_binary_to_decimal_modulo(key, hash_mod) * hash_random
+    new_key_value %= hash_mod
+    return np.array([int(i) for i in bin(new_key_value)[2:].zfill(hash_length)])
+
+
+def fast_binary_to_decimal_modulo(binary: np.ndarray, mod: int) -> int:
+    res = 0
+    for bit in reversed(binary):
+        res *= 2
+        res += bit
+        res %= mod
+    return int(res)
 
 
 #####
@@ -611,11 +582,12 @@ def bb84_quantum_phase(
     bob = Bob(sent_state)
 
     bob.measure_all_qubits()
+
     print("start agree key phase")
     agreed_key(alice, bob, eve)
     print("start qber calculation phase")
     estimated_qber, true_qber = calculate_qber(alice, bob, eve, qber_sacrifice_fraction)
-    print("end qber calculation phase")
+    print("end qber calculation phase", estimated_qber, true_qber)
     if print_mode is Output.SHORT:
         print_quantum_phase_summary(alice, bob, estimated_qber, true_qber)
     return alice, bob, eve, estimated_qber, true_qber
@@ -625,31 +597,35 @@ def qkd_bb84_algorithm(
     qber_sacrifice_fraction: float = 0.5,
     print_mode: Output = Output.NONE,
     ch_mode: ChannelMode = ChannelMode.NOISY,
+    allowed_key_leak: float = 2**-32,
 ):
     print_output(Output.EXTEND, print_mode, "start quantum phase")
     alice, bob, eve, estimated_qber, true_qber = bb84_quantum_phase(
         qber_sacrifice_fraction, print_mode, ch_mode
     )
 
-    if ch_mode is ChannelMode.NOISY:
-        print_output(Output.EXTEND, print_mode, "start reconciliation phase (cascade algorithm)")
-        reconciliation = Cascade(alice.key_after_qber, bob.key_after_qber, estimated_qber)
-        reconciliation.cascade()
-    elif ch_mode is ChannelMode.EAVESDROPPING:
-        print(np.average(eve.key_after_qber ^ alice.key_after_qber))
+    print_output(Output.EXTEND, print_mode, "start reconciliation phase (cascade algorithm)")
+    reconciliation = Cascade(alice.key_after_qber, bob.key_after_qber, estimated_qber)
+    bob.key_reconciliation, reveled_bits = reconciliation.cascade()
+    alice.key_reconciliation = alice.key_after_qber
 
-    print(f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}. Final key length: {reconciliation._key_len}")
+    if ch_mode is ChannelMode.EAVESDROPPING:
+        eve.study_key_from_reconciliation_leak(reveled_bits, bob.key_reconciliation)
+        pa_key_error, pa_key_leak = privacy_amplification(alice, bob, eve, allowed_key_leak)
+        print(pa_key_error, pa_key_leak)
+
+    print(f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}. Final key length: {len(bob.key_reconciliation)}")
     print("**************** quantum bit error rate ****************")
     print(f"estimated error: {estimated_qber}")
     print(f"true error: {true_qber}")
-    print(f"reveled bits rate {len(reconciliation._reveled_bits)/ reconciliation._key_len}")
+    print(f"reveled bits rate {len(reveled_bits) / len(bob.key_reconciliation)}")
     print(np.sum(bob.key_after_qber ^ alice.key_after_qber))
-    print(np.sum(np.array(reconciliation._noisy_key) ^ np.array(alice.key_after_qber)))
+    print(np.sum(bob.key_reconciliation ^ alice.key_after_qber))
 
 
 def main():
     args = cli()
-    qkd_bb84_algorithm(print_mode=False, ch_mode=ChannelMode.NOISY)
+    qkd_bb84_algorithm(ch_mode=ChannelMode.EAVESDROPPING)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,30 @@
+"""
+BB84 QKD Algorithm - Workshop in Quantum Computing & Cryptography.
+Made by Ofek Zohar (312490402).
+
+The implementation based on the above sources:
+    1. "Quantum cryptography: BB84 quantum key distribution by Nilanjana Datta & DAMTP Cambridge"
+    2. "Cascade - Post Quantum Reconciliation" (https://cascade-python.readthedocs.io/en/latest/protocol.html)
+    3. "Privacy Amplification - Post Quantum Reconciliation" Notes from the
+    
+Important general notes about the program & the implementation:
+    1. The program has a command line interface (cli) - managing the algorithm parameters
+        For more details run "python qky.py -h"
+    3. The implementation doesn't take communication delays and protocols into consideration! (communication is immediate)
+    2. The BB84 QKD algorithm is embarrassingly parallel - only 1-qubit gates, no entanglement.
+        a. I chose to represent the state as a list of separate qubits (like block diagonal state).
+           The perfect way to implement this kind of quantum circuit is using multi-CPU threads or GPU HW
+                unfortunately Python doesn't support real CPU intensive multi-threading (I tried... Python GIL is a problem).
+        b. So for small NUM_QUBIT numbers (under 1e9) it's more efficient to do sequential calculation.
+    3. Cascade implementation - I chose to use an odd-parity-queue to gain the most of the Cascade effect
+    4. Privacy Amplification - The eavesdropper (Eve) capability is to measure fraction of the qubits
+        at the "communication step" (MITM attack)
+        This a simple version of Amplification uses a hash function for extracting shorthand safe key.
+"""
+
 from enum import Enum
 import argparse
-from math import ceil, pi, floor
+from math import ceil, pi
 import random
 import time
 import numpy as np
@@ -8,8 +32,10 @@ from scipy.stats import unitary_group
 
 ################################ Constants & Globals ################################
 
-NUM_QUBITS = 100000
+NUM_QUBITS = 100000  # BB84 number of qubits
 NOISE_PROB = 0.125  # 1/8
+MAX_QUBITS_ALLOWED = 1000000  # The number of maximum qubits allowed on BB84 (a feasible run)
+MAX_QUBITS_ALLWOED_AMPLIFICATION = 1000  # The number of maximum qubits allowed on BB84 with amplification
 
 print_mode = None  # The algorithm output mode
 
@@ -54,56 +80,21 @@ class ChannelMode(Enum):
         return self.value
 
 
-def cli() -> argparse.Namespace:
-    # create a cli parser object
-    parser = argparse.ArgumentParser(description="QKD BB84 algorithm simulator. Made by Ofek Zohar.")
-
-    # Number of qubits argument
-    parser.add_argument(
-        "-n",
-        "--num-qubits",
-        metavar="num",
-        type=int,
-        help="Number of qubits to be used in the BB84 quantum phase.",
-    )
-
-    # Quantum channel mode argument
-    # determines the post quantum process (info reconciliation/privacy amplification)
-    parser.add_argument(
-        "-m",
-        "--mode",
-        metavar="channel_mode",
-        type=ChannelMode,
-        choices=list(ChannelMode),
-        default=ChannelMode.NOISY,
-        help="Quantum channel mode %(choices)a. (default: %(default)s)",
-    )
-
-    # Algorithm results printing mode
-    parser.add_argument(
-        "-o",
-        "--output",
-        metavar="output_mode",
-        type=cli_arg_to_output_enum,
-        choices=list(Output),
-        default=Output.NONE.name.lower(),
-        help="BB84 printing mode %(choices)a. (default: %(default)s)",
-    )
-
-    # qber sacrificed bit fraction argument
-    parser.add_argument(
-        "-f",
-        "--fraction",
-        type=fraction_float,
-        default=0.5,
-        help="Fraction of bits to be used ('sacrificed') to calculate quantum bit estimated error (AKA qber). (default: %(default)s)",
-    )
-
-    # parse the arguments from standard input
-    return parser.parse_args()
+################################ Handlers ################################
 
 
 def cli_arg_to_output_enum(astring: str) -> Output:
+    """Convert cli output argument to Output enum value. Handler for argparse parsing.
+
+    Args:
+        astring (str): cli argument to convert to Output enum
+
+    Raises:
+        argparse.ArgumentTypeError: If the provided argument can't cast to Output type
+
+    Returns:
+        Output: The corresponded Output enum value
+    """
     try:
         return Output[astring.upper()]
     except KeyError as exc:
@@ -111,7 +102,18 @@ def cli_arg_to_output_enum(astring: str) -> Output:
         raise argparse.ArgumentTypeError(msg) from exc
 
 
-def fraction_float(x) -> float:
+def fraction_float(x: str) -> float:
+    """Float fraction converter (in range [0.0,1.0]). Handler for argparse parsing.
+
+    Args:
+        x (str): The number to convert
+
+    Raises:
+        argparse.ArgumentTypeError: If x not represent a floating point or not in the range
+
+    Returns:
+        float: The converted fraction float
+    """
     try:
         x = float(x)
     except ValueError as exc:
@@ -123,25 +125,42 @@ def fraction_float(x) -> float:
 
 
 def print_output(required_mode: Output, msg: str):
+    """Print algorithm results according to the output mode
+
+    Args:
+        required_mode (Output): The required output mode for printing
+        msg (str): The message to be printed
+    """
     if print_mode is required_mode or (required_mode is Output.SHORT and print_mode is Output.EXTEND):
         print(msg)
 
 
 def compact_complex_repr(num: complex) -> str:
-    if np.isreal(num):
+    """Return compact string representation of complex numbers
+
+    Args:
+        num (complex): A complex number
+
+    Returns:
+        str: compact representation of num
+    """
+    if np.isreal(num):  # real number, exclude j
         if num.real == 1:
             return ""
         if num.real == -1:
             return "-"
         return format(num.real, "g")
+
+    # Special cases for imaginary numbers
     if num.imag == 1:
         return "j"
     if num.imag == -1:
         return "-j"
+
     return num
 
 
-######################## Quantum Phase - classes and handlers ########################
+######################## Quantum Phase - classes ########################
 
 
 class Qubit:
@@ -188,7 +207,6 @@ class Qubit:
             2. Measure the qubit state
             3. Rotate back to the provided base (from the computational base, apply U)
 
-
         Args:
             base (np.ndarray, optional): The base to measure by. Defaults to None (measure in the computational base).
 
@@ -226,14 +244,14 @@ class Player:
         # random generator, if not provided use default_rng()
         self._rnd = rnd if rnd is not None else np.random.default_rng()
 
-        self.key = None
-        self.agreed_key = None
-        self.key_after_qber = None
-        self.key_reconciliation = None
-        self.key_privacy_amplification = None
+        self.key = np.array([], dtype=int)
+        self.agreed_key = np.array([], dtype=int)
+        self.key_after_qber = np.array([], dtype=int)
+        self.key_reconciliation = np.array([], dtype=int)
+        self.key_privacy_amplification = np.array([], dtype=int)
 
-        self.encoding_base = None
-        self.quantum_state = None
+        self.encoding_base = np.array([], dtype=int)
+        self.quantum_state = []
 
 
 class Alice(Player):
@@ -382,7 +400,7 @@ class Eve(Player):
             self.key_reconciliation[i] = bob_key[i]
 
 
-######################## Reconciliation Phase - classes and handlers ########################
+######################## Reconciliation Phase - classes & implementation ########################
 
 
 class Block:
@@ -440,7 +458,9 @@ class Cascade:
         self._key_len = len(true_key)  # int: The key length
         self._true_key = true_key.copy()  # ndarray: The correct key bits
         self._noisy_key = noisy_key.copy()  # ndarray: The noisy key bits to be reconciliated
-        self._qber = max(qber, 1 / self._key_len)  # int: The noisy key qber, set minimum to 1/key_len
+        self._qber = (
+            max(qber, 1 / self._key_len) if self._key_len != 0 else qber
+        )  # int: The noisy key qber, set minimum to 1/key_len
         self._iterations = iterations  # int: Number of Cascade iterations
 
         self._shuffles = []  # list[ndarray]: list of index permutations for each iteration
@@ -531,11 +551,13 @@ class Cascade:
             np.ndarray: The reconciliated key
             list[int]: The reveled bits indexes
         """
+        if self._key_len == 0:  # No process
+            return self._noisy_key, []
         shuffle = range(self._key_len)  # 1st shuffle == the identity permutation
 
         for iter_num in range(self._iterations):  # Main Cascade loop iteration
             start_iter_time = time.time()
-            print_output(Output.SHORT, f"start iter {iter_num} time: {start_iter_time}")
+            print_output(Output.SHORT, f"start iter {iter_num}")
 
             if iter_num != 0:  # If not the 1st iteration, shuffle the key
                 shuffle = np.random.permutation(self._key_len)
@@ -557,30 +579,52 @@ class Cascade:
             end_iter_time = time.time()
             print_output(
                 Output.SHORT,
-                f"end iter {iter_num} time: {end_iter_time}. Took {end_iter_time-start_iter_time}",
+                f"end iter {iter_num}: Took {end_iter_time-start_iter_time}",
             )
 
         return self._noisy_key, self._reveled_bits
 
 
-####
+######################## Privacy Amplification Phase - implementation ########################
 
 
-def privacy_amplification(alice: Alice, bob: Bob, eve: Eve, allowed_key_leak: int):
-    new_key_length = floor(-np.log2(allowed_key_leak))  # The allowed leak is 2^-m when m is the new length
+def privacy_amplification(alice: Alice, bob: Bob, eve: Eve):
+    """Post quantum privacy amplification based on using an almost 2-universal hash function extractor (multiple shift bits - MSB)
+
+    The extractor multiply the key with a randomized number (up to 2^NUM_QUBITS) and keep the first new_key_length bits
+    Because of integer representation - no more than 64 bit length result allowed
+
+    Args:
+        alice (Alice): Alice player object
+        bob (Bob): Bob player object
+        eve (Eve): Eve player object
+    """
+    new_key_length = min(64, ceil(0.25 * len(alice.key_reconciliation)))  # The shorthand key length
+
+    # Choose the random hash_value (salt) for the MSB hash function
     hash_random_binary = np.random.default_rng().integers(2, size=len(alice.key_reconciliation))
     # The hash random value in binary repr
     hash_random_value = fast_binary_to_decimal_modulo(hash_random_binary, 2**new_key_length)
-    for player in [alice, bob, eve]:
+
+    for player in [alice, bob, eve]:  # Calculate the new extracted amplified key for every party
         player.key_privacy_amplification = universal_hash_extractor(
             player.key_reconciliation, hash_random_value, new_key_length
         )
-    eve_advantage_before_amp = 1 - np.average(alice.key_reconciliation ^ eve.key_reconciliation)
-    eve_advantage_after_amp = 1 - np.average(alice.key_privacy_amplification ^ eve.key_privacy_amplification)
-    return eve_advantage_before_amp, eve_advantage_after_amp
 
 
-def universal_hash_extractor(key: np.ndarray, hash_random: int, hash_length: int):
+def universal_hash_extractor(key: np.ndarray, hash_random: int, hash_length: int) -> np.ndarray:
+    """Applying hash function - multiple shift bits (almost 2-universal hash function)
+
+    new_key_value = (key_value * hash_random) mod hash_length (Keep only the first hash_length of bits)
+
+    Args:
+        key (np.ndarray): key to be hashed
+        hash_random (int): A random value determine the hash operation (Salt)
+        hash_length (int): The number of bits to be kept
+
+    Returns:
+        ndarray: The bit representation of the calculated hash value
+    """
     hash_mod = 2**hash_length
     new_key_value = fast_binary_to_decimal_modulo(key, hash_mod) * hash_random
     new_key_value %= hash_mod
@@ -588,6 +632,15 @@ def universal_hash_extractor(key: np.ndarray, hash_random: int, hash_length: int
 
 
 def fast_binary_to_decimal_modulo(binary: np.ndarray, mod: int) -> int:
+    """Fast bit-array numpy to decimal int under modulo.
+
+    Args:
+        binary (np.ndarray): The bit array
+        mod (int): The modulo
+
+    Returns:
+        int: The calculated number
+    """
     res = 0
     for bit in reversed(binary):
         res *= 2
@@ -596,7 +649,7 @@ def fast_binary_to_decimal_modulo(binary: np.ndarray, mod: int) -> int:
     return int(res)
 
 
-#####
+######################## BB84 Main Algorithm - classes & implementation ########################
 
 
 class BB84:
@@ -605,50 +658,59 @@ class BB84:
     Args:
         qber_sacrifice_fraction (:obj:`float`): The bit fraction used to estimate the qber. Defaults to 0.5.
         ch_mode (:obj:`ChannelMode`): The quantum channel mode. Defaults to ChannelMode.NOISY.
-        allowed_key_leak (:obj:`float`): The bit fraction used to perform the PA. Defaults to 2^-32.
     """
 
     def __init__(
         self,
         qber_sacrifice_fraction: float = 0.5,
         ch_mode: ChannelMode = ChannelMode.NOISY,
-        allowed_key_leak: float = 2**-32,
     ):
         self._ch_mode = ch_mode  # The quantum channel mode. Defaults to ChannelMode.NOISY.
 
         self._qber_sacrifice_fraction = qber_sacrifice_fraction
         # float: The bit fraction used to estimate the qber. Defaults to 0.5.
-        self._allowed_key_leak = allowed_key_leak
-        # float: The bit fraction used to perform the PA. Defaults to 2^-32.
 
         self._alice = None  # Alice: Alice player object
         self._bob = None  # Bob: Bob player object
         self._eve = None  # Eve: Eve player object
 
     def bb84(self):
-        print_output(Output.SHORT, "start quantum phase")
-        estimated_qber, true_qber = self.quantum_phase()
+        """The bb84 main algorithm"""
 
+        print_output(Output.SHORT, "----------------------------- Run BB84 -----------------------------")
+
+        # Quantum phase
+        start_time = time.time()
+        print_output(Output.SHORT, "##### start quantum phase ####")
+        estimated_qber, true_qber = self.quantum_phase()
         alice, bob, eve = self._alice, self._bob, self._eve
-        print_output(Output.SHORT, "start reconciliation phase (cascade algorithm)")
+        print_output(Output.SHORT, f"##### end quantum phase ({time.time()-start_time}) #####\n")
+
+        # Reconciliation phase
+        start_time = time.time()
+        print_output(Output.SHORT, "##### start reconciliation phase (cascade algorithm) #####")
+        reveled_bits = []
         reconciliation = Cascade(alice.key_after_qber, bob.key_after_qber, estimated_qber)
         bob.key_reconciliation, reveled_bits = reconciliation.cascade()
-        alice.key_reconciliation = alice.key_after_qber
+        alice.key_reconciliation = alice.key_after_qber  # Alice's key didn't change during the reconciliation
+        print_output(Output.SHORT, f"##### end reconciliation phase ({time.time()-start_time}) #####\n")
 
-        if self._ch_mode is ChannelMode.EAVESDROPPING:
+        # Amplification phase
+        if (
+            self._ch_mode is ChannelMode.EAVESDROPPING
+            and alice.key is not None
+            and len(alice.key_reconciliation) != 0
+        ):
+            start_time = time.time()
+            print_output(Output.SHORT, "##### start privacy amplification phase (hashing) #####")
             eve.study_key_from_reconciliation_leak(reveled_bits, bob.key_reconciliation)
-            pa_key_error, pa_key_leak = privacy_amplification(alice, bob, eve, self._allowed_key_leak)
-            print(pa_key_error, pa_key_leak)
+            privacy_amplification(alice, bob, eve)
+            print_output(
+                Output.SHORT, f"##### end privacy amplification phase ({time.time()-start_time}) #####\n"
+            )
+        print_output(Output.SHORT, "----------------------------- End of BB84 -----------------------------")
 
-        print(
-            f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}. Final key length: {len(bob.key_reconciliation)}"
-        )
-        print("**************** quantum bit error rate ****************")
-        print(f"estimated error: {estimated_qber}")
-        print(f"true error: {true_qber}")
-        print(f"reveled bits rate {len(reveled_bits) / len(bob.key_reconciliation)}")
-        print(np.sum(bob.key_after_qber ^ alice.key_after_qber))
-        print(np.sum(bob.key_reconciliation ^ alice.key_after_qber))
+        self._print_summary(estimated_qber, true_qber, len(reveled_bits))
 
     def quantum_phase(self) -> tuple[float, float]:
         """The quantum Phase of the BB84 algorithm (step 1-3)
@@ -656,31 +718,31 @@ class BB84:
         Returns:
             tuple[float, float]: The estimated qber (from the sacrificed bits), The true qber (from the remain bits)
         """
-        print_output(Output.SHORT, "start generate key step")
+
+        print_output(Output.SHORT, "generate key step")
         self._eve = Eve() if self._ch_mode is ChannelMode.EAVESDROPPING else None
         self._alice = Alice()
         self._alice.generate_key()
         self._alice.generate_quantum_state_for_bob()
 
-        print_output(Output.SHORT, "start quantum communication step")
-        sent_state = self._alice.send_state_to_bob()
+        print_output(Output.SHORT, "quantum communication step")
+        sent_state = self._alice.send_state_to_bob()  # Alice send the state through quantum channel
         if self._ch_mode is ChannelMode.EAVESDROPPING:
+            # Eve measure the qubits sent to Bob
             sent_state, _ = self._eve.measure_eavesdropped_qubits(sent_state)
-        self._bob = Bob(sent_state)
+        self._bob = Bob(sent_state)  # Bob get the sent state
 
         self._bob.measure_all_qubits()
 
-        print_output(Output.SHORT, "start key agree step")
-        self.agreed_key()
+        print_output(Output.SHORT, "key agree step")
+        self._agreed_key()
 
-        print_output(Output.SHORT, "start qber calculation step")
-        estimated_qber, true_qber = self.calculate_qber()
+        print_output(Output.SHORT, "qber calculation step")
+        estimated_qber, true_qber = self._calculate_qber()
 
-        if print_mode is Output.SHORT:
-            self.print_quantum_phase_summary(estimated_qber, true_qber)
         return estimated_qber, true_qber
 
-    def agreed_key(self) -> np.ndarray:
+    def _agreed_key(self) -> np.ndarray:
         """The key agreement step. Keep every bit measured (Bob) by the same base were encoded (Alice).
 
         Returns:
@@ -694,7 +756,7 @@ class BB84:
             self._eve.agreed_key = self._eve.key[same_base_indexes].copy()
         return same_base_indexes
 
-    def calculate_qber(self) -> tuple[float, float]:
+    def _calculate_qber(self) -> tuple[float, float]:
         """Calculating the Bob's key quantum bit error rate.
         Alice and Bob randomly chose sacrifice_fraction of the agreed key bits to estimate the error rate.
 
@@ -727,29 +789,168 @@ class BB84:
             eve.key_after_qber = eve.agreed_key[remain_bits].copy()
         return estimated_qber, true_qber
 
-    def print_quantum_phase_summary(self, estimated_qber: float, true_qber: float):
+    def _print_summary(self, estimated_qber: float, true_qber: float, num_reveled_bits: int):
+        """Print the BB84 algorithm summary according to the right output mode.
+
+        Args:
+            estimated_qber (float): The qber estimated after key agreement step
+            true_qber (float): The true qber after key agreement step
+            num_reveled_bits (int): The number of bits reveled by the reconciliation phase
+        """
         alice, bob, eve = self._alice, self._bob, self._eve
-        print(f"\nBB84 summary. Number of Qubits: {NUM_QUBITS}")
-        print("**************** keys ****************")
-        print(f"Alice's key: {alice.key}")
-        print(f"Bob's key: {bob.key}")
-        print("**************** bases ****************")
-        print(f"Alice's encoding bases: {alice.encoding_base}")
-        print(f"Bob's measuring bases: {bob.encoding_base}")
-        print("**************** agreed keys ****************")
-        print(f"Alice's agreed key: {alice.agreed_key}")
-        print(f"Bob's agreed key: {bob.agreed_key}")
-        print("**************** quantum bit error rate ****************")
-        print(f"estimated error: {estimated_qber}")
-        print(f"true error: {true_qber}")
-        print("**************** key after qber calculation ****************")
-        print(f"Alice's agreed key: {alice.key_after_qber}")
-        print(f"Bob's agreed key: {bob.key_after_qber}")
+        key_length = (
+            len(bob.key_privacy_amplification)
+            if self._ch_mode is ChannelMode.EAVESDROPPING
+            else len(bob.key_reconciliation)
+        )
+
+        print_output(
+            Output.SHORT,
+            f"""
+----------------------------- BB84 Summary -----------------------------
+Number of Qubits: {NUM_QUBITS}
+Final key length: {key_length}
+
+############# Quantum Phase Summary ##############""",
+        )
+
+        print_output(
+            Output.EXTEND,
+            f"""**************** original keys ****************
+Key length: {len(alice.key)}
+Alice's key: {alice.key}
+Bob's key: {bob.key}
+**************** encoding bases ****************
+Alice's encoding bases: {alice.encoding_base}
+Bob's measuring bases: {bob.encoding_base}
+**************** agreed keys ****************")
+Key length: {len(alice.agreed_key)}
+Alice's agreed key: {alice.agreed_key}
+Bob's agreed key: {bob.agreed_key}""",
+        )
+        if self._ch_mode is ChannelMode.EAVESDROPPING:
+            print_output(Output.EXTEND, f"Eve's agreed key: {eve.agreed_key}")
+
+        print_output(
+            Output.SHORT,
+            f"""**************** quantum bit error rate ****************
+estimated error: {estimated_qber}
+true error: {true_qber}""",
+        )
+
+        print_output(Output.SHORT, "\n############# Reconciliation Summary ##############")
+        print_output(
+            Output.EXTEND,
+            f"""**************** reconciliated keys ****************
+Alice's key: {alice.key_reconciliation}
+Bob's key: {bob.key_reconciliation}""",
+        )
+        print_output(
+            Output.SHORT,
+            f"""**************** rates ****************
+reveled bits rate: {num_reveled_bits / len(bob.key_reconciliation) if len(bob.key_reconciliation) != 0 else 0}
+qber after reconciliation: {np.average(bob.key_reconciliation ^ alice.key_reconciliation)}""",
+        )
+
+        if self._ch_mode is ChannelMode.EAVESDROPPING:
+            # Calculate the average diff of eve from the right key before/after amplification
+            eve_advantage_before_amp = 0.5 - np.average(alice.key_reconciliation ^ eve.key_reconciliation)
+            eve_advantage_after_amp = 0.5 - np.average(
+                alice.key_privacy_amplification ^ eve.key_privacy_amplification
+            )
+
+            print_output(Output.SHORT, "\n############# Privacy Amplification Summary ##############")
+            print_output(
+                Output.EXTEND,
+                f"""**************** Privacy Amplification keys ****************
+Key length: {len(alice.key_privacy_amplification) if alice.key_privacy_amplification is not None else 0}
+Alice's key: {alice.key_privacy_amplification}
+Bob's key: {bob.key_privacy_amplification}
+Eve's key: {eve.key_privacy_amplification}""",
+            )
+            print_output(
+                Output.SHORT,
+                f"""**************** Eve advantage compare to pure random choice (0.5) ****************
+Eve advantage before amplification: {eve_advantage_before_amp}
+Eve advantage after amplification: {eve_advantage_after_amp}""",
+            )
+
+
+######################## Main Program & command line interface ########################
+
+
+def cli() -> argparse.Namespace:
+    """Generates a cli for the BB84 program with optional flags.
+
+    Returns:
+        argparse.Namespace: cli argument parser
+    """
+    # create a cli parser object
+    parser = argparse.ArgumentParser(description="QKD BB84 algorithm simulator. Made by Ofek Zohar.")
+
+    # Number of qubits argument
+    parser.add_argument(
+        "-n",
+        "--num-qubits",
+        metavar="num",
+        type=int,
+        default=NUM_QUBITS,
+        help="Number of qubits to be used in the BB84 quantum phase.",
+    )
+
+    # Quantum channel mode argument
+    # determines the post quantum process (info reconciliation/privacy amplification)
+    parser.add_argument(
+        "-m",
+        "--mode",
+        metavar="channel_mode",
+        type=ChannelMode,
+        choices=list(ChannelMode),
+        default=ChannelMode.NOISY,
+        help="Quantum channel mode %(choices)a. (default: %(default)s)",
+    )
+
+    # Algorithm results printing mode
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="output_mode",
+        type=cli_arg_to_output_enum,
+        choices=list(Output),
+        default=Output.NONE.name.lower(),
+        help="BB84 printing mode %(choices)a. (default: %(default)s)",
+    )
+
+    # qber sacrificed bit fraction argument
+    parser.add_argument(
+        "-f",
+        "--fraction",
+        type=fraction_float,
+        default=0.5,
+        help="Fraction of bits to be used ('sacrificed') to calculate quantum bit estimated error (AKA qber). (default: %(default)s)",
+    )
+
+    # parse the arguments from standard input
+    return parser.parse_args()
 
 
 def main():
-    args = cli()
-    qkd_bb84_algorithm = BB84(ch_mode=ChannelMode.EAVESDROPPING)
+    """The main program"""
+    global NUM_QUBITS, print_mode
+
+    args = cli()  # Create the command line interface
+    NUM_QUBITS = args.num_qubits  # setting the number of qubits for the BB84 algorithm
+    if 1 > NUM_QUBITS or NUM_QUBITS > MAX_QUBITS_ALLOWED:
+        print(f"Number of qubits should be in range [1, {MAX_QUBITS_ALLOWED}]")
+        return
+    print_mode = args.output  # Setting the algorithm's printing mode
+
+    if args.mode is ChannelMode.EAVESDROPPING and NUM_QUBITS > MAX_QUBITS_ALLWOED_AMPLIFICATION:
+        print(f"Amplification phase is limited to {MAX_QUBITS_ALLWOED_AMPLIFICATION} qubits!")
+        return
+
+    # Run the BB84 algorithm
+    qkd_bb84_algorithm = BB84(ch_mode=args.mode, qber_sacrifice_fraction=args.fraction)
     qkd_bb84_algorithm.bb84()
 
 
